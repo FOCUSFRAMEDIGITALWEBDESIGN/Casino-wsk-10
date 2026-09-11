@@ -40,9 +40,6 @@ def symbol_name(value: str) -> str:
 @dataclass(frozen=True)
 class Settings:
     token: str = field(repr=False)
-    guild_id: int
-    channel_id: int
-    owners: frozenset[int]
     key: str = field(repr=False)
     secret: str = field(repr=False)
     watchlist: tuple[str, ...] = ("AAPL", "MSFT", "NVDA", "SPY", "QQQ")
@@ -120,13 +117,19 @@ class Settings:
             "WATCHLIST", "AAPL,MSFT,NVDA,AMZN,META,GOOGL,AMD,TSLA,SPY,QQQ").split(",") if s.strip()))
         if not 1 <= len(watchlist) <= 20:
             raise ValueError("WATCHLIST benötigt 1 bis 20 Symbole.")
-        owners = frozenset(int(x.strip()) for x in required("DISCORD_OWNER_IDS").split(","))
-        guild_id, channel_id = int(required("DISCORD_GUILD_ID")), int(required("DISCORD_CHANNEL_ID"))
-        if min(guild_id, channel_id, *owners) <= 0:
-            raise ValueError("Discord-IDs müssen positive Zahlen sein.")
         if kwargs["close_before_minutes"] >= kwargs["entry_cutoff_minutes"]:
             raise ValueError("ENTRY_CUTOFF_MINUTES muss größer als CLOSE_BEFORE_MINUTES sein.")
-        return cls(token=required("DISCORD_TOKEN"), guild_id=guild_id, channel_id=channel_id,
-                   owners=owners, key=required("ALPACA_PAPER_KEY"), secret=required("ALPACA_PAPER_SECRET"),
+
+        # Nur zwei Secrets nötig: DISCORD_TOKEN und ALPACA_KEY.
+        # ALPACA_KEY enthält Alpaca Key-ID und Secret im Format KEY_ID:SECRET_KEY.
+        alpaca = required("ALPACA_KEY")
+        if ":" not in alpaca:
+            raise ValueError("ALPACA_KEY muss im Format KEY_ID:SECRET_KEY eingetragen werden.")
+        key, secret = alpaca.split(":", 1)
+        key, secret = key.strip(), secret.strip()
+        if not key or not secret:
+            raise ValueError("ALPACA_KEY muss Key-ID und Secret enthalten.")
+
+        return cls(token=required("DISCORD_TOKEN"), key=key, secret=secret,
                    watchlist=watchlist, allow_shorts=raw_bool == "true",
                    data_dir=resolve_data_dir(), **kwargs)
