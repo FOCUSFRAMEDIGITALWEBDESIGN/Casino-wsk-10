@@ -17,9 +17,14 @@ log = logging.getLogger("paperbot")
 
 class GuardedTree(app_commands.CommandTree):
     async def interaction_check(self, interaction):
-        cfg = self.client.cfg
-        if interaction.guild_id != cfg.guild_id or interaction.user.id not in cfg.owners:
-            await interaction.response.send_message("Dieser Befehl ist nur für die eingetragenen Bot-Bediener auf dem festgelegten Server verfügbar.", ephemeral=True)
+        # Beim ersten Befehl wird der Bediener automatisch als Besitzer gespeichert.
+        # Danach darf nur dieser Discord-Account den Bot steuern.
+        owner_id = self.client.store.get("discord_owner_id")
+        if owner_id is None:
+            self.client.store.set("discord_owner_id", int(interaction.user.id))
+            owner_id = int(interaction.user.id)
+        if int(interaction.user.id) != int(owner_id):
+            await interaction.response.send_message("Dieser Bot wurde bereits von einem anderen Discord-Account übernommen.", ephemeral=True)
             return False
         return True
 
@@ -53,15 +58,13 @@ class PaperDiscord(discord.Client):
     async def setup_hook(self):
         self.http_session = aiohttp.ClientSession()
         self.engine = Engine(self.cfg, self.store, AlpacaPaper(self.cfg, self.http_session))
-        guild = discord.Object(id=self.cfg.guild_id)
-        self.tree.copy_global_to(guild=guild)
-        await self.tree.sync(guild=guild)
+        await self.tree.sync()
         self.poll.change_interval(seconds=self.cfg.poll_seconds)
         self.poll.start()
         self.deliver.start()
 
     async def on_ready(self):
-        log.info("Discord verbunden. Guild=%s Channel=%s", self.cfg.guild_id, self.cfg.channel_id)
+        log.info("Discord verbunden als %s", self.user)
         await self.change_presence(activity=discord.Game(name="Papertrading | /hilfe"))
         self.store.event("boot:" + self.boot_id, "Paper Trader ist online",
                          "US-Aktien · Alpaca Paper · Kontowährung USD\n"
@@ -69,9 +72,12 @@ class PaperDiscord(discord.Client):
                          "Befehle: /hilfe · /status · /konto · /pause · /notstopp\nErster Kurs-/Broker-Abgleich läuft.")
 
     async def resolve_channel(self):
-        channel = self.get_channel(self.cfg.channel_id) or await self.fetch_channel(self.cfg.channel_id)
-        if not isinstance(channel, discord.TextChannel) or channel.guild.id != self.cfg.guild_id:
-            raise ValueError("DISCORD_CHANNEL_ID muss ein Textkanal des festgelegten Servers sein.")
+        channel_id = self.store.get("discord_channel_id")
+        if not channel_id:
+            raise ValueError("Noch kein Meldekanal gesetzt. Im gewünschten Discord-Kanal einmal /start ausführen.")
+        channel = self.get_channel(int(channel_id)) or await self.fetch_channel(int(channel_id))
+        if not isinstance(channel, discord.TextChannel):
+            raise ValueError("Der gespeicherte Meldekanal ist nicht mehr verfügbar.")
         member = channel.guild.me
         perms = channel.permissions_for(member) if member else None
         if not perms or not (perms.view_channel and perms.send_messages and perms.embed_links):
@@ -186,6 +192,10 @@ class PaperDiscord(discord.Client):
         @tree.command(name="start", description="Automatische Paper-Einstiege aktivieren")
         async def start(interaction: discord.Interaction):
             await interaction.response.defer(ephemeral=True)
+            if interaction.channel_id is None:
+                raise ValueError("/start muss in einem Server-Textkanal ausgeführt werden.")
+            self.store.set("discord_channel_id", int(interaction.channel_id))
+            self.channel = None
             await self.resolve_channel()
             await self.engine.set_enabled(True)
             self.store.event("manual-start:" + uuid.uuid4().hex, "PAPER · Automatik aktiviert", "Der Bot wartet auf ein gültiges Signal. Tages-, Zeit- und Risikolimits bleiben aktiv.")
