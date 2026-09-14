@@ -227,7 +227,7 @@ class GatewayBot(discord.Client):
 
 
 def run_gateway():
-    token = os.getenv("DISCORD_TOKEN", "").strip()
+    token = (os.getenv("DISCORD_TOKEN", "").strip() or os.getenv("discord_token", "").strip())
     if not token:
         raise RuntimeError("DISCORD_TOKEN fehlt; Gateway-Bot kann nicht starten.")
     directory = Path(os.getenv("DATA_DIR", "./data"))

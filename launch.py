@@ -57,10 +57,10 @@ if __name__ == '__main__':
         run_tests()
         check_volume()
         bot.LOG.info('VOLUME CHECK OK | Discord gateway configured=%s',
-                     bool(os.getenv('DISCORD_TOKEN')))
+                     bool(os.getenv('DISCORD_TOKEN', '').strip() or os.getenv('discord_token', '').strip()))
         http = bot.Http()
         probe_sources(http, bot.Market(http))
-    if os.getenv('DISCORD_TOKEN', '').strip():
+    if os.getenv('DISCORD_TOKEN', '').strip() or os.getenv('discord_token', '').strip():
         from discord_gateway import run_gateway
         run_gateway()
     else:
