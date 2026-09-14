@@ -23,17 +23,17 @@ def probe_sources(http, market):
         _, dated = bot.parse_fx(http.request(bot.ECB), datetime.now(timezone.utc).date())
         checks['ECB'] = 'OK ' + dated
     except Exception as exc:
-        checks['ECB'] = 'UNAVAILABLE ' + type(exc).__name__
+        checks['ECB'] = 'UNAVAILABLE ' + type(exc).__name__ + ' HTTP=' + str(getattr(exc, 'http_status', 'n/a'))
     try:
         checks['DEX_PROFILES'] = 'OK candidates=' + str(len(market.discover()))
     except Exception as exc:
-        checks['DEX_PROFILES'] = 'UNAVAILABLE ' + type(exc).__name__
+        checks['DEX_PROFILES'] = 'UNAVAILABLE ' + type(exc).__name__ + ' HTTP=' + str(getattr(exc, 'http_status', 'n/a'))
     try:
         p = market.pair(bot.SOL)
         market.pair(bot.SOL, p['pairAddress'])
         checks['DEX_POOLS'] = 'OK'
     except Exception as exc:
-        checks['DEX_POOLS'] = 'UNAVAILABLE ' + type(exc).__name__
+        checks['DEX_POOLS'] = 'UNAVAILABLE ' + type(exc).__name__ + ' HTTP=' + str(getattr(exc, 'http_status', 'n/a'))
     try:
         reply = http.json(market.rpc, {
             'jsonrpc': '2.0', 'id': 1, 'method': 'getAccountInfo',
@@ -42,7 +42,7 @@ def probe_sources(http, market):
             raise ValueError('Missing mint')
         checks['SOLANA_RPC'] = 'OK'
     except Exception as exc:
-        checks['SOLANA_RPC'] = 'UNAVAILABLE ' + type(exc).__name__
+        checks['SOLANA_RPC'] = 'UNAVAILABLE ' + type(exc).__name__ + ' HTTP=' + str(getattr(exc, 'http_status', 'n/a'))
     for name, status in checks.items():
         bot.LOG.info('STARTUP DATA %s %s', name, status)
 

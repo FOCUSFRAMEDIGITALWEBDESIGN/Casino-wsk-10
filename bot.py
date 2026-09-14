@@ -14,6 +14,7 @@ import sqlite3
 import threading
 import time
 import urllib.request
+import urllib.error
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timezone
@@ -87,6 +88,10 @@ class Http:
             if len(raw) > 2_000_000:
                 raise ValueError('Antwort zu groß')
             return raw
+        except urllib.error.HTTPError as exc:
+            error = RuntimeError('Datenabruf fehlgeschlagen')
+            error.http_status = exc.code
+            raise error from None
         except Exception:
             raise RuntimeError('Datenabruf fehlgeschlagen') from None
 
