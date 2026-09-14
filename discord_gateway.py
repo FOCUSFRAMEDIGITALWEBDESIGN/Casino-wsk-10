@@ -49,14 +49,18 @@ class PaperTree(app_commands.CommandTree):
 
 class GatewayBot(discord.Client):
     def __init__(self, store):
+        intents = discord.Intents.none()
+        intents.guilds = True
         super().__init__(
-            intents=discord.Intents.none(),
+            intents=intents,
             allowed_mentions=discord.AllowedMentions.none())
         self.store = store
         self.tree = PaperTree(self)
-        self.http = bot.Http()
-        self.market = bot.Market(self.http)
-        self.engine = bot.Engine(store, self.market, self.http)
+        # Keep the custom market client separate from discord.Client.http.
+        # discord.py owns self.http and needs its static_login/close methods.
+        self.market_http = bot.Http()
+        self.market = bot.Market(self.market_http)
+        self.engine = bot.Engine(store, self.market, self.market_http)
         self.authorized_ids = _ids(os.getenv("DISCORD_OWNER_IDS"))
         self.ticker_task = None
         self.channel = None
