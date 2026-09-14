@@ -37,7 +37,7 @@ def main():
     if sys.platform != "win32":
         import fcntl
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise SystemExit("Es läuft bereits ein Bot mit diesem DATA_DIR.")
     else:

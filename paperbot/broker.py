@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 import aiohttp
+import time
 from .config import PAPER_URL, DATA_URL
 from .strategy import NY
 
@@ -18,6 +19,9 @@ class AlpacaPaper:
         self.session = session
         self.headers = {"APCA-API-KEY-ID": settings.key, "APCA-API-SECRET-KEY": settings.secret}
         self.secrets = (settings.key, settings.secret)
+        self.feed = settings.feed
+        self.data_gate = asyncio.Lock()
+        self.last_data_request = 0.0
 
     async def request(self, method, path, *, data_api=False, params=None, body=None):
         if not path.startswith("/v2/") or ".." in path:
@@ -26,9 +30,13 @@ class AlpacaPaper:
         for attempt in range(3 if method == "GET" else 1):
             delay = 1 + attempt
             try:
+                if data_api:
+                    async with self.data_gate:
+                        await asyncio.sleep(max(0, 0.4 - (time.monotonic() - self.last_data_request)))
+                        self.last_data_request = time.monotonic()
                 async with self.session.request(method, url, headers=self.headers, params=params,
                                                 json=body, allow_redirects=False,
-                                                timeout=aiohttp.ClientTimeout(total=15)) as response:
+                                                timeout=aiohttp.ClientTimeout(total=8)) as response:
                     if response.status == 204:
                         return None
                     try:
@@ -90,12 +98,12 @@ class AlpacaPaper:
 
     async def quotes(self, symbols):
         result = await self.request("GET", "/v2/stocks/quotes/latest", data_api=True,
-                                    params={"symbols": ",".join(symbols), "feed": "iex"})
+                                    params={"symbols": ",".join(symbols), "feed": self.feed})
         return result.get("quotes", {})
 
     async def calendar(self, now):
         rows = await self.request("GET", "/v2/calendar", params={
-            "start": (now - timedelta(days=10)).date().isoformat(), "end": now.date().isoformat()})
+            "start": (now - timedelta(days=60)).date().isoformat(), "end": now.date().isoformat()})
         return {r["date"]: tuple(datetime.fromisoformat(r["date"] + "T" + r[key]).replace(tzinfo=NY).astimezone(timezone.utc)
                                   for key in ("open", "close")) for r in rows}
 
@@ -113,3 +121,32 @@ class AlpacaPaper:
                 return result
             params["page_token"] = token
         raise BrokerError(0, "Kursdaten-Paginierung unvollständig; dieser Scan wird verworfen")
+
+    async def assets(self):
+        rows = await self.request("GET", "/v2/assets", params={"status": "active", "asset_class": "us_equity"})
+        if not isinstance(rows, list):
+            raise BrokerError(0, "Ungültige Aktienliste")
+        return rows
+
+    async def history(self, symbols, start, end, timeframe="5Min"):
+        """Paginate all symbols, fail instead of using truncated data."""
+        if not symbols:
+            return {}
+        params = {"symbols": ",".join(symbols), "timeframe": timeframe,
+                  "feed": self.feed, "adjustment": "split", "sort": "asc",
+                  "start": start.isoformat(), "end": end.isoformat(), "limit": 10000}
+        result = {s: [] for s in symbols}
+        seen = set()
+        for _ in range(100):
+            page = await self.request("GET", "/v2/stocks/bars", data_api=True, params=params)
+            for symbol, bars in (page.get("bars") or {}).items():
+                if symbol in result:
+                    result[symbol].extend(bars)
+            token = page.get("next_page_token")
+            if not token:
+                return result
+            if token in seen:
+                raise BrokerError(0, "Wiederholter Kursdaten-Seitentoken")
+            seen.add(token)
+            params["page_token"] = token
+        raise BrokerError(0, "Unvollständige Historie – Scan abgebrochen")

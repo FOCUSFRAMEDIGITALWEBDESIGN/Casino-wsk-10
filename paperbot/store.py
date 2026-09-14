@@ -1,13 +1,16 @@
 import csv
 import io
 import json
+import os
 import sqlite3
+import tempfile
 import time
 from pathlib import Path
 
 
 class Store:
     def __init__(self, path: Path):
+        self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, isolation_level=None)
         self.db.row_factory = sqlite3.Row
@@ -32,6 +35,29 @@ class Store:
                 bucket INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, equity TEXT NOT NULL,
                 cash TEXT NOT NULL, day_pl TEXT NOT NULL);
         """)
+
+    def backup_before_v2(self):
+        """Snapshot the complete SQLite journal before the first V2 activation."""
+        if self.get("strategy_version") == "orb-v2":
+            return None
+        destination = self.path.with_name("paperbot-before-v2.sqlite3")
+        if destination.exists():
+            return destination
+        fd, temporary = tempfile.mkstemp(prefix="journal-backup-", suffix=".sqlite3", dir=self.path.parent)
+        os.close(fd)
+        try:
+            backup = sqlite3.connect(temporary)
+            try:
+                self.db.backup(backup)
+                if backup.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise RuntimeError("Journal-Sicherung ist beschädigt; Upgrade abgebrochen.")
+            finally:
+                backup.close()
+            os.replace(temporary, destination)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return destination
 
     def get(self, key, default=None):
         row = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()

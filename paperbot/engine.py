@@ -4,9 +4,12 @@ from decimal import Decimal
 import json
 import time
 import uuid
+from dataclasses import replace
+from datetime import timedelta
+from .scanner import Scanner
 from .broker import BrokerError
 from .config import number
-from .strategy import NY, analyze, instant, make_entry
+from .strategy import NY, instant, make_entry
 
 TERMINAL = {"filled", "canceled", "expired", "rejected", "replaced"}
 
@@ -29,6 +32,11 @@ class Engine:
         self.last_scan = 0.0
         self.calendar, self.calendar_day = {}, ""
         self.initialized = False
+        self.scanner = Scanner(settings, store, broker)
+        self.candidates = []
+        self.scan_ok = False
+        self.scan_error = ""
+        self.scanning = False
         if self.store.get("watchlist") is None:
             self.store.set("watchlist", list(settings.watchlist))
 
@@ -74,6 +82,9 @@ class Engine:
                  f"Positionen: {len(self.positions)} · Einstiegsversuche heute: {self.store.entries(self.today)}/{self.cfg.max_trades}",
                  f"{'Börsenschluss' if self.clock['is_open'] else 'Nächste Öffnung'}: <t:{int(next_time.timestamp())}:f>",
                  f"Neue Einstiege: {self.block_reason or 'freigegeben, warte auf Signal'}"]
+        lines.append("Aktiensuche: " + self.scanner.summary)
+        if self.scan_error:
+            lines.append("Scannerfehler: " + self.scan_error)
         if self.notes:
             lines.append("\n**Letzter Scan**\n" + "\n".join(f"{s}: {n}" for s, n in list(self.notes.items())[:10]))
         return "\n".join(lines)
@@ -220,6 +231,7 @@ class Engine:
             self.block_reason = "Broker-Abgleich läuft."
             await self.fresh()
             await self.reconcile()
+            self.check_protection()
             now = instant(self.clock["timestamp"])
             self.store.session(self.today, self.account["last_equity"])
             _, pct = self.pnl()
@@ -264,59 +276,158 @@ class Engine:
             if time.time() - self.store.get("last_heartbeat", 0) >= interval * 60:
                 self.store.event(f"heartbeat:{int(time.time() // 60)}", "PAPER · Regelmäßiger Status", self.summary())
                 self.store.set("last_heartbeat", time.time())
-            if opened and time.time() - self.last_scan >= self.cfg.scan_seconds:
-                await self.scan(notification_ok)
-                self.last_scan = time.time()
             self.initialized = True
+            if opened and not self.block_reason and self.scan_ok:
+                await self.dispatch(notification_ok)
 
-    async def scan(self, notification_ok):
-        if not self.watchlist:
-            self.notes = {"Watchlist": "Leer. /watch_add verwenden."}
+    async def prepare_scan(self):
+        """Data work intentionally runs outside the order/position lock."""
+        if self.scanning:
             return
-        now = instant(self.clock["timestamp"])
-        if self.calendar_day != self.today:
-            self.calendar = await self.broker.calendar(now)
-            self.calendar_day = self.today
-        bars = await self.broker.bars(self.watchlist, now)
-        self.notes = {}
-        for symbol in self.watchlist:
-            signal, note = analyze(symbol, bars.get(symbol, []), now, self.calendar)
-            self.notes[symbol] = note
-            if not signal:
+        self.scanning = True
+        try:
+            clock = await self.broker.clock()
+            now = instant(clock["timestamp"])
+            if abs((datetime.now(timezone.utc)-now).total_seconds()) > 30:
+                raise ValueError("Scanner-Brokerzeit ungültig.")
+            candidates, notes = await self.scanner.run(now, self.watchlist)
+            # Publishing is atomic on the event loop; old candidates expire independently.
+            self.candidates, self.notes = candidates, notes
+            self.scan_ok, self.scan_error = True, ""
+            self.last_scan = time.time()
+            self.store.set("scanner_ranking", {"at": now.isoformat(), "rows": self.scanner.ranking})
+        except Exception as exc:
+            self.candidates, self.scan_ok = [], False
+            self.scan_error = str(exc) if isinstance(exc, (ValueError, BrokerError)) else type(exc).__name__
+            raise
+        finally:
+            self.scanning = False
+
+    def open_risk(self):
+        """Conservative stop reserve incl. pending quantity and adverse moves."""
+        total = Decimal(0)
+        covered = set()
+        by_symbol = {p["symbol"]: p for p in self.positions}
+        for row in self.store.intents(active=True):
+            if row["kind"] != "entry":
                 continue
-            self.store.event("signal:" + signal.client_id, f"PAPER · Signal · {symbol}",
-                             f"{'LONG' if signal.side == 'buy' else 'SHORT'} · {signal.reason}\nSignal ist noch keine Order. Kurs-, Konto- und Risikoprüfungen folgen.")
-            await self.fresh()
-            self.block_reason = self.entry_block(notification_ok)
-            if self.block_reason or self.store.traded_symbol(self.today, symbol):
-                self.notes[symbol] = self.block_reason or "Heute bereits einen Einstieg für dieses Symbol versucht."
+            payload = json.loads(row["payload"])
+            symbol = row["symbol"]
+            entry = number(payload["limit_price"])
+            stop = number(payload["stop_loss"]["stop_price"])
+            if row["snapshot"]:
+                snapshot = json.loads(row["snapshot"])
+                actual = [number(leg["stop_price"]) for leg in snapshot.get("legs") or []
+                          if leg.get("stop_price") and leg.get("status") not in TERMINAL]
+                if actual:
+                    stop = min([stop]+actual) if payload["side"] == "buy" else max([stop]+actual)
+            qty = number(payload["qty"])
+            position = by_symbol.get(symbol)
+            if position:
+                qty = max(qty, abs(number(position["qty"])))
+                price = number(position.get("current_price") or entry)
+                # Worst of planned and current-to-stop risk, without netting.
+                distance = max(abs(entry-stop),abs(price-stop))
+            else:
+                distance = abs(entry-stop)
+            total += qty*(distance+entry*self.cfg.cost_buffer_pct/100)
+            covered.add(symbol)
+        if any(p["symbol"] not in covered for p in self.positions):
+            raise ValueError("Offenes Positionsrisiko nicht eindeutig zuordenbar.")
+        return total
+
+    def check_protection(self):
+        """A filled entry with no active broker stop must be flattened."""
+        positions = {p["symbol"] for p in self.positions}
+        for row in self.store.intents(active=True):
+            if row["kind"] != "entry" or not row["snapshot"] or row["symbol"] not in positions:
                 continue
-            _, pct = self.pnl()
-            if pct <= -self.cfg.daily_loss_pct:
-                self.store.halt(self.today)
-                self.queue_managed_closes("Tagesverlustlimit erreicht.")
-                self.block_reason = "Tagesverlustlimit erreicht."
-                break
-            if (instant(self.clock["timestamp"]) - instant(signal.timestamp)).total_seconds() > 660:
-                self.notes[symbol] = "Signal inzwischen veraltet."
+            order = json.loads(row["snapshot"])
+            if order.get("status") != "filled":
+                continue
+            stops = [leg for leg in order.get("legs") or [] if leg.get("type") in ("stop","stop_limit","trailing_stop")
+                     and leg.get("status") not in TERMINAL | {"pending_cancel","done_for_day","suspended"}]
+            if not stops:
+                self.store.request_close(row["symbol"], "Gefüllte Position ohne bestätigten aktiven Stop schließen.")
+                self.store.event("unprotected:"+row["cid"],"PAPER · Stop fehlt · "+row["symbol"],
+                                 "Broker meldet keine aktive Stoporder. Kontrollierte Schließung angefordert.",0xE74C3C)
+
+    def correlation_block(self, signal):
+        """Small-sample concentration guard, not a forecast of diversification."""
+        own = self.scanner.metrics.get(signal.symbol,{}).get("returns",{})
+        exposures = {p["symbol"]: 1 if number(p["qty"]) > 0 else -1 for p in self.positions}
+        for o in self.open_orders:
+            if o.get("client_order_id", "").startswith("pd-e-"):
+                exposures[o["symbol"]] = 1 if o["side"] == "buy" else -1
+        direction = 1 if signal.side == "buy" else -1
+        for symbol, side in exposures.items():
+            other = self.scanner.metrics.get(symbol,{}).get("returns",{})
+            dates = sorted(set(own) & set(other))
+            if len(dates) < 10:
+                return "Zu wenig gemeinsame Historie für die Konzentrationsprüfung."
+            xs, ys = [number(own[d]) for d in dates], [number(other[d]) for d in dates]
+            ax, ay = sum(xs)/len(xs), sum(ys)/len(ys)
+            vx, vy = sum((x-ax)**2 for x in xs), sum((y-ay)**2 for y in ys)
+            if min(vx,vy) <= 0:
+                return "Korrelation bei unveränderter Historie nicht bestimmbar."
+            corr = sum((x-ax)*(y-ay) for x,y in zip(xs,ys))/(vx*vy).sqrt()
+            if corr*direction*side > Decimal("0.85"):
+                return f"Ähnliche bestehende Exposition: {symbol} · Korrelation {corr:.2f}."
+        return ""
+
+    async def dispatch(self, notification_ok):
+        """Called only under lock after position monitoring; at most one attempt/tick."""
+        while self.candidates:
+            signal = self.candidates.pop(0)
+            if self.store.traded_symbol(self.today, signal.symbol):
+                continue
+            now = datetime.now(timezone.utc)
+            age = (now-(instant(signal.timestamp)+timedelta(minutes=5))).total_seconds()
+            if not 0 <= age <= 90:
+                self.notes[signal.symbol] = "Signal beim Orderentscheid veraltet."
                 continue
             try:
-                asset = await self.broker.asset(symbol)
+                asset = await self.broker.asset(signal.symbol)
                 if asset.get("status") != "active" or not asset.get("tradable") or asset.get("class") != "us_equity":
-                    raise ValueError("Aktie derzeit nicht handelbar.")
-                if signal.side == "sell" and not all(asset.get(k) for k in ("shortable", "easy_to_borrow", "marginable")):
-                    raise ValueError("Aktie ist derzeit nicht für diesen Short-Einstieg verfügbar.")
-                quotes = await self.broker.quotes([symbol])
-                if symbol not in quotes:
-                    raise ValueError("Keine IEX-Quote vorhanden.")
+                    raise ValueError("Aktie nicht handelbar.")
+                if signal.side == "sell" and not all(asset.get(k) for k in ("shortable","easy_to_borrow","marginable")):
+                    raise ValueError("Short nicht verfügbar.")
+                quote = (await self.broker.quotes([signal.symbol])).get(signal.symbol)
+                if not quote:
+                    raise ValueError("Aktuelle IEX-Quote fehlt.")
+                # Latest broker state after potentially slow market-data call.
+                await self.fresh()
+                self.block_reason = self.entry_block(notification_ok)
+                if self.block_reason:
+                    return
+                concentration = self.correlation_block(signal)
+                if concentration:
+                    raise ValueError(concentration)
+                now = datetime.now(timezone.utc)
+                if not 0 <= (now-(instant(signal.timestamp)+timedelta(minutes=5))).total_seconds() <= 90:
+                    raise ValueError("Signal inzwischen veraltet.")
+                pl, pct = self.pnl()
+                if pct <= -self.cfg.daily_loss_pct:
+                    self.store.halt(self.today)
+                    self.queue_managed_closes("Tagesverlustlimit erreicht.")
+                    return
+                equity = number(self.account["equity"])
+                baseline = number(self.store.session(self.today,self.account["last_equity"])["baseline"])
+                reserved = self.open_risk()
+                remaining = min(equity*self.cfg.portfolio_risk_pct/100-reserved,
+                                baseline*self.cfg.daily_loss_pct/100-max(Decimal(0),-pl)-reserved)
+                if remaining <= 0:
+                    raise ValueError("Gemeinsames Risikobudget ausgeschöpft.")
+                cfg = replace(self.cfg, risk_pct=min(self.cfg.risk_pct,remaining/equity*100))
                 pending = [o for o in self.open_orders if o.get("client_order_id", "").startswith("pd-e-")]
-                payload = make_entry(signal, quotes[symbol], datetime.now(timezone.utc), self.account, self.positions, pending, self.cfg)
-            except ValueError as exc:
-                self.notes[symbol] = str(exc)
+                payload = make_entry(signal,quote,now,self.account,self.positions,pending,cfg)
+            except (ValueError, KeyError) as exc:
+                self.notes[signal.symbol] = str(exc)
                 continue
-            await self.submit(payload, "entry")
-            self.notes[symbol] = "Paperorder übermittelt; warte auf Broker-Ausführung."
-        self.block_reason = self.entry_block(notification_ok)
+            self.store.event("signal:"+signal.client_id,"PAPER · Ausgewählt · "+signal.symbol,signal.reason)
+            await self.submit(payload,"entry")
+            self.notes[signal.symbol] = "Paperorder gesendet; Brokerfüllung wird separat gemeldet."
+            return
 
     async def set_enabled(self, enabled):
         async with self.lock:

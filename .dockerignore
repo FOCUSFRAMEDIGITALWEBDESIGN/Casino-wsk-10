@@ -1,11 +1,7 @@
-.git
-.venv
 .env
-.env.*
-**/__pycache__
-**/*.pyc
-data
-logs
-*.zip
-*.sqlite*
-*.db
+data/
+logs/
+tests/
+__pycache__/
+*.pyc
+.git/

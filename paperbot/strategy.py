@@ -31,10 +31,14 @@ class Signal:
     timestamp: str
     price: Decimal
     reason: str
+    stop_distance: Decimal | None = None
+    atr: Decimal | None = None
+    rvol: Decimal = Decimal(0)
 
     @property
     def client_id(self):
-        seed = f"{self.symbol}|{self.side}|{self.timestamp}".encode()
+        version = "orb-v2" if self.stop_distance is not None else "ema-v1"
+        seed = f"{version}|{self.symbol}|{self.side}|{self.timestamp}".encode()
         return "pd-e-" + hashlib.sha256(seed).hexdigest()[:32]
 
 
@@ -79,12 +83,14 @@ def analyze(symbol, raw_bars, now, calendar):
 
 def make_entry(signal: Signal, quote, now, account, positions, open_entries, settings: Settings):
     age = (now - instant(quote["t"])).total_seconds()
-    if not -5 <= age <= settings.quote_max_age:
+    if not 0 <= age <= settings.quote_max_age:
         raise ValueError("Quote fehlt oder ist veraltet.")
     bid, ask = number(quote["bp"]), number(quote["ap"])
     if bid <= 0 or ask < bid or number(quote.get("bs", 0)) <= 0 or number(quote.get("as", 0)) <= 0:
         raise ValueError("Kein gültiger handelbarer Geld-/Briefkurs.")
     mid = (bid + ask) / 2
+    if signal.atr is not None and abs(mid-signal.price) > signal.atr/2:
+        raise ValueError("Kurs ist mehr als 0,5 ATR vom Signal entfernt.")
     if (ask - bid) / mid * 100 > settings.max_spread_pct:
         raise ValueError("Spread ist zu groß.")
     if abs(mid / signal.price - 1) * 100 > settings.max_drift_pct:
@@ -97,8 +103,12 @@ def make_entry(signal: Signal, quote, now, account, positions, open_entries, set
     rounding = ROUND_CEILING if signal.side == "buy" else ROUND_FLOOR
     reference = ask if signal.side == "buy" else bid
     entry = (reference * (1 + sign * settings.entry_slippage_pct / 100)).quantize(Decimal("0.01"), rounding=rounding)
-    stop = (entry * (1 - sign * settings.stop_pct / 100)).quantize(Decimal("0.01"))
+    planned_distance = signal.stop_distance or entry * settings.stop_pct / 100
+    stop = (entry - sign * planned_distance).quantize(Decimal("0.01"))
     distance = abs(entry - stop)
+    if signal.stop_distance is not None and ((ask-bid)/distance > Decimal("0.1") or
+            not Decimal("0.15") <= distance/entry*100 <= Decimal("2")):
+        raise ValueError("Spread/Stopabstand nach Preisrundung unzulässig.")
     target = (entry + sign * distance * settings.reward_r).quantize(Decimal("0.01"))
     if min(entry, stop, target, distance) <= 0:
         raise ValueError("Ungültige Orderpreise.")
@@ -115,7 +125,8 @@ def make_entry(signal: Signal, quote, now, account, positions, open_entries, set
     gross += sum((number(o["qty"]) * number(o["limit_price"]) for o in open_entries), Decimal(0))
     capital = min(equity * settings.position_pct / 100,
                   equity * settings.gross_pct / 100 - gross, buying_power * Decimal("0.95"))
-    qty = int(min(capital / entry, equity * settings.risk_pct / 100 / distance).to_integral_value(rounding=ROUND_FLOOR))
+    risk_per_share = distance + entry*settings.cost_buffer_pct/100
+    qty = int(min(capital / entry, equity * settings.risk_pct / 100 / risk_per_share).to_integral_value(rounding=ROUND_FLOOR))
     if qty < 1:
         raise ValueError("Kein Platz im Kapital-/Risikolimit für eine ganze Aktie.")
     return {"symbol": signal.symbol, "side": signal.side, "qty": str(qty), "type": "limit",

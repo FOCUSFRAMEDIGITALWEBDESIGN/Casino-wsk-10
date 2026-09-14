@@ -42,9 +42,9 @@ class Settings:
     token: str = field(repr=False)
     key: str = field(repr=False)
     secret: str = field(repr=False)
-    watchlist: tuple[str, ...] = ("AAPL", "MSFT", "NVDA", "SPY", "QQQ")
+    watchlist: tuple[str, ...] = ()
     allow_shorts: bool = True
-    risk_pct: Decimal = Decimal("1")
+    risk_pct: Decimal = Decimal("0.25")
     stop_pct: Decimal = Decimal("1")
     reward_r: Decimal = Decimal("2")
     daily_loss_pct: Decimal = Decimal("3")
@@ -53,10 +53,10 @@ class Settings:
     max_positions: int = 3
     max_trades: int = 3
     entry_slippage_pct: Decimal = Decimal("0.10")
-    max_spread_pct: Decimal = Decimal("0.25")
+    max_spread_pct: Decimal = Decimal("0.10")
     max_drift_pct: Decimal = Decimal("0.50")
     entry_timeout: int = 120
-    quote_max_age: int = 120
+    quote_max_age: int = 10
     scan_seconds: int = 60
     poll_seconds: int = 15
     status_minutes: int = 30
@@ -64,6 +64,13 @@ class Settings:
     entry_cutoff_minutes: int = 30
     close_before_minutes: int = 10
     data_dir: Path = Path("data")
+    feed: str = "iex"
+    shortlist_size: int = 80
+    opening_minutes: int = 15
+    min_rvol: Decimal = Decimal("1.5")
+    portfolio_risk_pct: Decimal = Decimal("0.75")
+    cost_buffer_pct: Decimal = Decimal("0.05")
+    min_dollar_volume: Decimal = Decimal("1000000")
 
     @classmethod
     def from_env(cls):
@@ -80,14 +87,18 @@ class Settings:
         if raw_bool not in ("true", "false"):
             raise ValueError("ALLOW_SHORTS muss true oder false sein.")
         decimal_fields = {
-            "risk_pct": ("RISK_PER_TRADE_PCT", "1", 5),
+            "risk_pct": ("RISK_PER_TRADE_PCT", "0.25", 1),
             "stop_pct": ("STOP_LOSS_PCT", "1", 10),
             "reward_r": ("TAKE_PROFIT_R", "2", 10),
             "daily_loss_pct": ("DAILY_LOSS_LIMIT_PCT", "3", 20),
             "position_pct": ("MAX_POSITION_PCT", "20", 100),
             "gross_pct": ("MAX_GROSS_EXPOSURE_PCT", "60", 100),
             "entry_slippage_pct": ("ENTRY_SLIPPAGE_PCT", "0.10", 1),
-            "max_spread_pct": ("MAX_SPREAD_PCT", "0.25", 2),
+            "max_spread_pct": ("MAX_SPREAD_PCT", "0.10", 1),
+            "min_rvol": ("MIN_RVOL", "1.5", 20),
+            "portfolio_risk_pct": ("PORTFOLIO_RISK_PCT", "0.75", 3),
+            "cost_buffer_pct": ("COST_BUFFER_PCT", "0.05", 1),
+            "min_dollar_volume": ("MIN_FEED_DOLLAR_VOLUME", "1000000", 1000000000),
             "max_drift_pct": ("MAX_SIGNAL_DRIFT_PCT", "0.50", 2),
         }
         kwargs = {}
@@ -100,7 +111,8 @@ class Settings:
             "max_positions": ("MAX_POSITIONS", 3, 1, 10),
             "max_trades": ("MAX_TRADES_PER_DAY", 3, 1, 20),
             "entry_timeout": ("ENTRY_TIMEOUT_SECONDS", 120, 30, 300),
-            "quote_max_age": ("QUOTE_MAX_AGE_SECONDS", 120, 10, 120),
+            "quote_max_age": ("QUOTE_MAX_AGE_SECONDS", 10, 1, 30),
+            "shortlist_size": ("SCANNER_SHORTLIST_SIZE", 80, 20, 200),
             "scan_seconds": ("SCAN_INTERVAL_SECONDS", 60, 30, 300),
             "poll_seconds": ("POLL_INTERVAL_SECONDS", 15, 10, 60),
             "status_minutes": ("STATUS_INTERVAL_MINUTES", 30, 1, 1440),
@@ -114,9 +126,9 @@ class Settings:
                 raise ValueError(f"{env}: zulässig sind {minimum} bis {maximum}.")
             kwargs[field_name] = value
         watchlist = tuple(dict.fromkeys(symbol_name(s) for s in os.getenv(
-            "WATCHLIST", "AAPL,MSFT,NVDA,AMZN,META,GOOGL,AMD,TSLA,SPY,QQQ").split(",") if s.strip()))
-        if not 1 <= len(watchlist) <= 20:
-            raise ValueError("WATCHLIST benötigt 1 bis 20 Symbole.")
+            "WATCHLIST", "").split(",") if s.strip()))
+        if len(watchlist) > 20:
+            raise ValueError("WATCHLIST erlaubt maximal 20 manuelle Ergänzungen.")
         if kwargs["close_before_minutes"] >= kwargs["entry_cutoff_minutes"]:
             raise ValueError("ENTRY_CUTOFF_MINUTES muss größer als CLOSE_BEFORE_MINUTES sein.")
 

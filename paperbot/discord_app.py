@@ -17,14 +17,12 @@ log = logging.getLogger("paperbot")
 
 class GuardedTree(app_commands.CommandTree):
     async def interaction_check(self, interaction):
-        # Beim ersten Befehl wird der Bediener automatisch als Besitzer gespeichert.
-        # Danach darf nur dieser Discord-Account den Bot steuern.
-        owner_id = self.client.store.get("discord_owner_id")
-        if owner_id is None:
-            self.client.store.set("discord_owner_id", int(interaction.user.id))
-            owner_id = int(interaction.user.id)
-        if int(interaction.user.id) != int(owner_id):
-            await interaction.response.send_message("Dieser Bot wurde bereits von einem anderen Discord-Account übernommen.", ephemeral=True)
+        if interaction.guild_id is None or int(interaction.user.id) not in self.client.authorized_ids:
+            await interaction.response.send_message("Nur der Discord-Anwendungsbesitzer bzw. das Entwicklerteam darf den Bot in einem Server bedienen.", ephemeral=True)
+            return False
+        guild = self.client.store.get("discord_guild_id")
+        if guild and int(guild) != interaction.guild_id:
+            await interaction.response.send_message("Bitte den eingerichteten Discord-Server verwenden.", ephemeral=True)
             return False
         return True
 
@@ -53,15 +51,31 @@ class PaperDiscord(discord.Client):
         self.channel = None
         self.boot_id = uuid.uuid4().hex
         self.last_delivery = 0.0
+        self.authorized_ids = set()
+        self.broker_ready_logged = False
+        self.last_scanner_summary = None
         self.register_commands()
 
     async def setup_hook(self):
+        info = await self.application_info()
+        if info.team:
+            self.authorized_ids = {m.id for m in info.team.members if m.role in (
+                discord.TeamMemberRole.admin, discord.TeamMemberRole.developer)} | {info.team.owner_id}
+        else:
+            self.authorized_ids = {info.owner.id}
+        if self.store.get("strategy_version") != "orb-v2":
+            backup = self.store.backup_before_v2()
+            self.store.set("enabled", False)
+            self.store.set("strategy_version", "orb-v2")
+            log.info("V2-Upgrade: Journal gesichert (%s); neue Einstiege pausiert bis /start.", backup.name)
         self.http_session = aiohttp.ClientSession()
         self.engine = Engine(self.cfg, self.store, AlpacaPaper(self.cfg, self.http_session))
         await self.tree.sync()
         self.poll.change_interval(seconds=self.cfg.poll_seconds)
         self.poll.start()
         self.deliver.start()
+        self.research.change_interval(seconds=self.cfg.scan_seconds)
+        self.research.start()
 
     async def on_ready(self):
         log.info("Discord verbunden als %s", self.user)
@@ -94,6 +108,10 @@ class PaperDiscord(discord.Client):
     async def poll(self):
         try:
             await self.engine.tick(self.notification_ok())
+            if self.engine.initialized and not self.broker_ready_logged:
+                log.info("V2: Alpaca-Paper-Abgleich erfolgreich; Positionen=%d, offene Orders=%d, Automatik=%s.",
+                         len(self.engine.positions), len(self.engine.open_orders), self.engine.enabled)
+                self.broker_ready_logged = True
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -105,6 +123,26 @@ class PaperDiscord(discord.Client):
 
     @poll.before_loop
     async def before_poll(self):
+        await self.wait_until_ready()
+
+    @tasks.loop(seconds=60)
+    async def research(self):
+        # No position lock: slow universe/history downloads do not hold up exits.
+        try:
+            await self.engine.prepare_scan()
+            if self.engine.scanner.summary != self.last_scanner_summary:
+                log.info("V2 Aktiensuche: %s", self.engine.scanner.summary)
+                self.last_scanner_summary = self.engine.scanner.summary
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            detail = str(exc) if isinstance(exc, (ValueError, BrokerError)) else type(exc).__name__
+            log.warning("Scanner wartet: %s", detail)
+            self.store.event(f"scanner-error:{int(time.time()//900)}", "PAPER · Aktiensuche wartet",
+                             detail+"\nPositionsüberwachung läuft unabhängig weiter.", 0xF39C12)
+
+    @research.before_loop
+    async def before_research(self):
         await self.wait_until_ready()
 
     @tasks.loop(seconds=3)
@@ -130,7 +168,7 @@ class PaperDiscord(discord.Client):
 
     async def close(self):
         running = []
-        for loop in (self.poll, self.deliver):
+        for loop in (self.poll, self.deliver, self.research):
             task = loop.get_task()
             loop.cancel()
             if task:
@@ -156,12 +194,12 @@ class PaperDiscord(discord.Client):
         async def help_command(interaction: discord.Interaction):
             await reply(interaction, "Paper Trader · Hilfe",
                         "**Ansehen**\n/status – Markt, Kontostand, letzter Scan\n/konto – USD-Kontowerte\n"
-                        "/positionen – offene Positionen\n/watchlist – beobachtete Symbole\n/verlauf – letzte Meldungen\n"
+                        "/positionen – offene Positionen\n/scanner – automatische Aktiensuche\n/watchlist – manuelle Ergänzungen\n/verlauf – letzte Meldungen\n"
                         "/export – Konto-/Orderdaten als CSV\n\n**Steuern**\n/start – automatische Paper-Einstiege aktivieren\n"
                         "/pause – neue und noch ungefüllte Einstiege stoppen; gefüllte Positionen weiter überwachen\n"
                         "/schliessen symbol:AAPL – Position/Order schließen\n/notstopp bestaetigen:True – pausieren und alle Positionen/Orders des Paperkontos schließen\n"
                         "/watch_add und /watch_remove – Watchlist ändern\n/auftrag_pruefen – unklaren Orderversuch abgleichen\n\n"
-                        "EMA-9/21-Kreuz + RSI + Volumen, abgeschlossene 5-Minuten-Kerzen, IEX-Feed. "
+                        "Automatische Liquiditätsauswahl → 15-Minuten-Eröffnungsspanne → bestätigter Ausbruch + VWAP + RVOL. IEX-Feed. "
                         "Handel während regulärer US-Sitzungen. Meldungen laufen rund um die Uhr. "
                         "Keine Gewinngarantie; Simulationsergebnisse können vom echten Handel abweichen.")
 
@@ -192,14 +230,27 @@ class PaperDiscord(discord.Client):
         @tree.command(name="start", description="Automatische Paper-Einstiege aktivieren")
         async def start(interaction: discord.Interaction):
             await interaction.response.defer(ephemeral=True)
-            if interaction.channel_id is None:
+            if not isinstance(interaction.channel, discord.TextChannel):
                 raise ValueError("/start muss in einem Server-Textkanal ausgeführt werden.")
+            self.store.set("discord_guild_id", int(interaction.guild_id))
             self.store.set("discord_channel_id", int(interaction.channel_id))
             self.channel = None
             await self.resolve_channel()
             await self.engine.set_enabled(True)
             self.store.event("manual-start:" + uuid.uuid4().hex, "PAPER · Automatik aktiviert", "Der Bot wartet auf ein gültiges Signal. Tages-, Zeit- und Risikolimits bleiben aktiv.")
             await reply(interaction, "Automatik aktiviert", self.engine.summary())
+
+        @tree.command(name="scanner", description="Automatische Aktienauswahl, RVOL-Rangliste und Datenstatus")
+        async def scanner(interaction: discord.Interaction):
+            snapshot = self.store.get("scanner_ranking", {})
+            rows = snapshot.get("rows", [])
+            body = self.engine.scanner.summary + "\n"
+            if self.engine.scan_error:
+                body += "Fehler: " + self.engine.scan_error + "\n"
+            body += "Stand: " + snapshot.get("at", "noch keine fertige Auswertung")
+            body += "\n\n" + "\n".join(f"{i+1}. **{r['symbol']}** · RVOL {number(r['rvol']):.2f}" for i,r in enumerate(rows))
+            body += "\n\nRangliste ist kein Kaufauftrag. Einstieg nur nach Signal- und Risikoprüfung. IEX ist ein Teilmarkt."
+            await reply(interaction, "Automatische Aktiensuche", body)
 
         @tree.command(name="pause", description="Neue Einstiege stoppen; gefüllte Positionen weiter überwachen")
         async def pause(interaction: discord.Interaction):
