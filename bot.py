@@ -225,7 +225,11 @@ class Market:
 
 class Store:
     def __init__(self, path):
-        self.db = sqlite3.connect(path, timeout=10, isolation_level=None)
+        # The Discord gateway runs the paper cycle in a worker thread while
+        # slash-command handlers use the event-loop thread.
+        self.lock = threading.RLock()
+        self.db = sqlite3.connect(path, timeout=10, isolation_level=None,
+                                  check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('PRAGMA synchronous=FULL')
@@ -251,30 +255,36 @@ class Store:
 
     @contextlib.contextmanager
     def tx(self):
-        self.db.execute('BEGIN IMMEDIATE')
-        try:
-            yield
-            self.db.execute('COMMIT')
-        except BaseException:
-            self.db.execute('ROLLBACK')
-            raise
+        with self.lock:
+            self.db.execute('BEGIN IMMEDIATE')
+            try:
+                yield
+                self.db.execute('COMMIT')
+            except BaseException:
+                self.db.execute('ROLLBACK')
+                raise
 
     def get(self, key, default=None):
-        row = self.db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
-        return row[0] if row else default
+        with self.lock:
+            row = self.db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+            return row[0] if row else default
 
     def put(self, key, value):
-        self.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', (key, str(value)))
+        with self.lock:
+            self.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', (key, str(value)))
 
     def positions(self):
-        return self.db.execute('SELECT * FROM positions WHERE closed IS NULL ORDER BY id').fetchall()
+        with self.lock:
+            return self.db.execute('SELECT * FROM positions WHERE closed IS NULL ORDER BY id').fetchall()
 
     def event(self, now, message):
-        self.db.execute('INSERT INTO events(ts,message) VALUES (?,?)', (now, message))
-        LOG.info(message)
+        with self.lock:
+            self.db.execute('INSERT INTO events(ts,message) VALUES (?,?)', (now, message))
+            LOG.info(message)
 
     def equity(self):
-        return number(self.get('cash')) + sum((number(p['mark'] or '0') for p in self.positions()), D(0))
+        with self.lock:
+            return number(self.get('cash')) + sum((number(p['mark'] or '0') for p in self.positions()), D(0))
 
     def start_day(self, now):
         with self.tx():
@@ -363,7 +373,8 @@ class Store:
                     self.event(now, f'PAPER {p["symbol"]}: Bewertung fehlt; Position bleibt offen, Käufe gesperrt.')
 
     def status(self, now):
-        positions = [dict(p) for p in self.positions()]
+        with self.lock:
+            positions = [dict(p) for p in self.positions()]
         incomplete = any(p['error'] or p['marked'] is None or not 0 <= now - p['marked'] <= 120
                          for p in positions)
         return {'mode': 'PAPER_ONLY', 'stake_eur_including_buy_costs': str(STAKE),

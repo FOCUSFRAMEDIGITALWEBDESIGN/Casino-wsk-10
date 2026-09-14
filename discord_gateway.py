@@ -149,9 +149,10 @@ class GatewayBot(discord.Client):
 
         @self.tree.command(name="verlauf", description="Letzte abgeschlossene Paper-Trades anzeigen")
         async def history_command(interaction: discord.Interaction):
-            rows = self.store.db.execute(
-                "SELECT symbol,proceeds,pnl,reason,closed FROM positions "
-                "WHERE closed IS NOT NULL ORDER BY closed DESC LIMIT 10").fetchall()
+            with self.store.lock:
+                rows = self.store.db.execute(
+                    "SELECT symbol,proceeds,pnl,reason,closed FROM positions "
+                    "WHERE closed IS NOT NULL ORDER BY closed DESC LIMIT 10").fetchall()
             if not rows:
                 await interaction.response.send_message("Noch keine abgeschlossenen Paper-Trades.", ephemeral=True)
                 return
@@ -217,8 +218,9 @@ class GatewayBot(discord.Client):
         if self.channel is None:
             return
         while True:
-            event = self.store.db.execute(
-                "SELECT id,message FROM events WHERE sent=0 ORDER BY id LIMIT 1").fetchone()
+            with self.store.lock:
+                event = self.store.db.execute(
+                    "SELECT id,message FROM events WHERE sent=0 ORDER BY id LIMIT 1").fetchone()
             if event is None:
                 return
             try:
@@ -227,7 +229,8 @@ class GatewayBot(discord.Client):
                     allowed_mentions=discord.AllowedMentions.none())
             except (discord.HTTPException, discord.Forbidden):
                 return
-            self.store.db.execute("UPDATE events SET sent=1 WHERE id=?", (event["id"],))
+            with self.store.lock:
+                self.store.db.execute("UPDATE events SET sent=1 WHERE id=?", (event["id"],))
 
 
 def run_gateway():
