@@ -54,3 +54,10 @@ Offline tests do not establish profitability or successful blockchain execution.
 - [Solana authorities](https://solana.com/docs/tokens/basics/set-authority)
 - [ECB reference rates](https://www.ecb.europa.eu/stats/policy_and_exchange_rates/euro_reference_exchange_rates/html/index.en.html)
 - [Discord webhooks](https://docs.discord.com/developers/resources/webhook)
+
+## Rate limits
+
+HTTP 429 obeys Retry-After (seconds or HTTP date). Without that header the client waits
+60 seconds, then doubles up to 960 seconds between unsuccessful attempts. The wait applies
+per host; it does not block unrelated data providers or the process heartbeat. Missing data
+continues to block buys. The 35 offline tests also run on process startup for visible verification.

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+from email.utils import parsedate_to_datetime
 import json
 import logging
 import os
@@ -73,10 +74,19 @@ class Http:
     """Bounded requests; exceptions deliberately omit URLs and credentials."""
     def __init__(self):
         self.last = 0.0
+        self.blocked_until = {}
+        self.failures = {}
 
     def request(self, url, payload=None):
         if urlparse(url).scheme != 'https':
             raise ValueError('Nur HTTPS erlaubt')
+        host = urlparse(url).hostname
+        remaining = self.blocked_until.get(host, 0) - time.monotonic()
+        if remaining > 0:
+            error = RuntimeError('Abruflimit: Wartezeit aktiv')
+            error.http_status = 429
+            error.retry_after = remaining
+            raise error
         time.sleep(max(0, .3 - (time.monotonic() - self.last)))
         self.last = time.monotonic()
         body = None if payload is None else json.dumps(payload).encode()
@@ -87,10 +97,31 @@ class Http:
                 raw = response.read(2_000_001)
             if len(raw) > 2_000_000:
                 raise ValueError('Antwort zu groß')
+            self.failures.pop(host, None)
             return raw
         except urllib.error.HTTPError as exc:
             error = RuntimeError('Datenabruf fehlgeschlagen')
             error.http_status = exc.code
+            if exc.code == 429:
+                failures = self.failures.get(host, 0)
+                wait = 60 * (2 ** min(failures, 4))
+                header = exc.headers.get('Retry-After') if exc.headers else None
+                if header:
+                    try:
+                        parsed = number(header)
+                        if parsed >= 0:
+                            wait = max(1, float(parsed))
+                    except ValueError:
+                        try:
+                            dated = parsedate_to_datetime(header)
+                            if dated.tzinfo is None:
+                                dated = dated.replace(tzinfo=timezone.utc)
+                            wait = max(1, dated.timestamp() - time.time())
+                        except (TypeError, ValueError, OverflowError):
+                            pass
+                self.failures[host] = failures + 1
+                self.blocked_until[host] = time.monotonic() + wait
+                error.retry_after = wait
             raise error from None
         except Exception:
             raise RuntimeError('Datenabruf fehlgeschlagen') from None
@@ -389,8 +420,12 @@ class Engine:
             return
         try:
             self.scan(fx)
-        except Exception:
-            self.store.put('scanner', 'Kandidat übersprungen: Daten-/RPC-Fehler')
+        except Exception as exc:
+            if getattr(exc, 'http_status', None) == 429:
+                self.store.put('scanner', 'Datenquelle HTTP 429; Wiederholung in ca. '
+                               + str(int(getattr(exc, 'retry_after', 60))) + ' Sekunden')
+            else:
+                self.store.put('scanner', 'Kandidat übersprungen: Daten-/RPC-Fehler')
 
     def scan(self, fx):
         now = self.clock()

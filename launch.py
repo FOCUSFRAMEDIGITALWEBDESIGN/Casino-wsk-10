@@ -3,6 +3,7 @@ import logging
 import os
 from pathlib import Path
 import sys
+import subprocess
 import time
 from datetime import datetime, timezone
 import bot
@@ -66,6 +67,8 @@ class ObservedEngine(bot.Engine):
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
     if len(sys.argv) > 1 and sys.argv[1] in ('run', 'once'):
+        subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s',
+                        str(Path(__file__).parent / 'tests')], check=True)
         check_volume()
         bot.LOG.info('VOLUME CHECK OK | Discord configured=%s', bool(os.getenv('DISCORD_WEBHOOK_URL')))
     bot.Engine = ObservedEngine
