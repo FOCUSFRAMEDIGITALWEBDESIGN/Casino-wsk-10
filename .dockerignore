@@ -1,7 +1,6 @@
+data
+__pycache__
+*.sqlite3*
+*.csv
 .env
-data/
-logs/
-tests/
-__pycache__/
-*.pyc
-.git/
+.git

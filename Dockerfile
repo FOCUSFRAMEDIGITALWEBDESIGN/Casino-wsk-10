@@ -1,8 +1,7 @@
 FROM python:3.12-slim
-ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY main.py ./
-COPY paperbot ./paperbot
-CMD ["python", "-u", "main.py"]
+COPY bot.py launch.py /app/
+COPY tests /app/tests
+RUN python -m unittest discover -s tests -v
+ENV PYTHONUNBUFFERED=1 DATA_DIR=/data TRADING_MODE=paper
+CMD ["python", "-u", "launch.py", "run"]

@@ -1,6 +1,5 @@
-.env
 data/
-logs/
 __pycache__/
-*.pyc
-.venv/
+*.sqlite3*
+*.csv
+.env
