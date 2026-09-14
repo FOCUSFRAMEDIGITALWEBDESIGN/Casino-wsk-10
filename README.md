@@ -35,11 +35,9 @@ Railway requires exactly one instance with its own volume at /data.
 launch.py refuses Railway startup without the persistent mount and logs source probes plus heartbeats.
 SQLite stores positions, balance, day limits and events. Keep the whole data directory when backing up.
 
-Optional variables: DISCORD_WEBHOOK_URL, SOLANA_RPC_URL, WATCH_MINTS.
+Required for the Gateway deployment: DISCORD_TOKEN. Optional: DISCORD_GUILD_ID, DISCORD_OWNER_IDS, SOLANA_RPC_URL, WATCH_MINTS.
 DATA_DIR=/data and TRADING_MODE=paper are fixed deployment settings.
-No Discord slash commands: optional webhook sends trade events. It needs a separately configured
-channel webhook; no existing stock-bot token is copied. Missing notifications do not stop monitoring.
-Webhook delivery can duplicate an event after an interrupted response; event IDs remain stable.
+Discord Gateway uses a separate DISCORD_TOKEN. Available commands: /start, /status, /positionen, /scanner, /pause, /schliessen, /verlauf and /hilfe. Set DISCORD_GUILD_ID for quick command sync and optionally DISCORD_OWNER_IDS (comma-separated user IDs). Without it, the Discord application owner is authorized. The existing stock-bot token is not copied. Missing Discord delivery does not stop paper monitoring; events remain stored.
 
 ## Validation
 
@@ -61,3 +59,5 @@ HTTP 429 obeys Retry-After (seconds or HTTP date). Without that header the clien
 60 seconds, then doubles up to 960 seconds between unsuccessful attempts. The wait applies
 per host; it does not block unrelated data providers or the process heartbeat. Missing data
 continues to block buys. The 35 offline tests also run on process startup for visible verification.
+
+The image installs discord.py 2.7.1. Invite the Discord application with bot and applications.commands scopes. Only the separate token is needed in Railway.

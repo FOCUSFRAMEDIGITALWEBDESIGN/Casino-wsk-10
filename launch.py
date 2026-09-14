@@ -1,11 +1,9 @@
-"""Railway entry point: persistent-volume guard, public read probes and heartbeat."""
+"""Railway entry point: persistent-volume guard, tests, probes and Discord Gateway."""
 import logging
 import os
 from pathlib import Path
-import sys
 import subprocess
-import time
-from datetime import datetime, timezone
+import sys
 import bot
 
 
@@ -21,7 +19,7 @@ def check_volume():
 def probe_sources(http, market):
     checks = {}
     try:
-        _, dated = bot.parse_fx(http.request(bot.ECB), datetime.now(timezone.utc).date())
+        _, dated = bot.parse_fx(http.request(bot.ECB), __import__('datetime').datetime.now(__import__('datetime').timezone.utc).date())
         checks['ECB'] = 'OK ' + dated
     except Exception as exc:
         checks['ECB'] = 'UNAVAILABLE ' + type(exc).__name__ + ' HTTP=' + str(getattr(exc, 'http_status', 'n/a'))
@@ -48,28 +46,22 @@ def probe_sources(http, market):
         bot.LOG.info('STARTUP DATA %s %s', name, status)
 
 
-class ObservedEngine(bot.Engine):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.last_report = 0
-        probe_sources(self.http, self.market)
-
-    def tick(self):
-        super().tick()
-        now = self.clock()
-        if now - self.last_report >= 60:
-            bot.LOG.info('HEARTBEAT mode=PAPER stake_eur=20 open=%s fx_date=%s scanner=%s',
-                         len(self.store.positions()), self.store.get('fx_date'),
-                         self.store.get('scanner'))
-            self.last_report = now
+def run_tests():
+    subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s',
+                    str(Path(__file__).parent / 'tests')], check=True)
 
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
     if len(sys.argv) > 1 and sys.argv[1] in ('run', 'once'):
-        subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s',
-                        str(Path(__file__).parent / 'tests')], check=True)
+        run_tests()
         check_volume()
-        bot.LOG.info('VOLUME CHECK OK | Discord configured=%s', bool(os.getenv('DISCORD_WEBHOOK_URL')))
-    bot.Engine = ObservedEngine
-    bot.main()
+        bot.LOG.info('VOLUME CHECK OK | Discord gateway configured=%s',
+                     bool(os.getenv('DISCORD_TOKEN')))
+        http = bot.Http()
+        probe_sources(http, bot.Market(http))
+    if os.getenv('DISCORD_TOKEN', '').strip():
+        from discord_gateway import run_gateway
+        run_gateway()
+    else:
+        bot.main()
